@@ -3,12 +3,22 @@ const express = require('express');
 const cors = require('cors');
 
 const app = express();
-app.use(cors());
+
+// Разрешаем запросы со всех доменов
+app.use(cors({
+    origin: '*',
+    methods: ['POST', 'GET', 'OPTIONS'],
+    allowedHeaders: ['Content-Type']
+}));
+
 app.use(express.json());
 
 const apiKeys = process.env.GEMINI_KEYS ? process.env.GEMINI_KEYS.split(',') : [];
 let currentKeyIndex = 0;
 const MODEL = "gemini-3.1-flash-lite";
+
+// Обработка предварительного запроса (preflight)
+app.options('*', cors());
 
 app.post('/api/generate', async (req, res) => {
     const { prompt } = req.body;
