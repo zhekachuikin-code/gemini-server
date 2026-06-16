@@ -4,14 +4,16 @@ const cors = require('cors');
 
 const app = express();
 
-// Настройка CORS: разрешаем запросы отовсюду
+// Настройка CORS: разрешаем любые запросы
 app.use(cors({
     origin: '*',
     methods: ['POST', 'GET', 'OPTIONS'],
     allowedHeaders: ['Content-Type']
 }));
 
-app.use(express.json());
+// Увеличиваем лимит размера для тяжелых страниц товаров
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 const apiKeys = process.env.GEMINI_KEYS ? process.env.GEMINI_KEYS.split(',') : [];
 let currentKeyIndex = 0;
@@ -21,7 +23,7 @@ app.post('/api/generate', async (req, res) => {
     const { prompt } = req.body;
 
     if (!apiKeys.length) {
-        return res.status(500).json({ error: 'Секретные ключи не найдены' });
+        return res.status(500).json({ error: 'Секретные ключи не настроены' });
     }
 
     let attempts = 0;
