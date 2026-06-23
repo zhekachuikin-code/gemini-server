@@ -4,7 +4,7 @@ const cors = require('cors');
 
 const app = express();
 
-// Настройка CORS: разрешаем любые запросы
+// Настройка CORS: разрешаем любые запросы 
 app.use(cors({
     origin: '*',
     methods: ['POST', 'GET', 'OPTIONS'],
