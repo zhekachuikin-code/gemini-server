@@ -15,7 +15,13 @@ app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 const apiKeys = process.env.GEMINI_KEYS ? process.env.GEMINI_KEYS.split(',').map(k => k.trim()) : [];
 let currentKeyIndex = 0;
-const MODEL = "gemini-3.1-flash-lite";
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite";
+// Запасні моделі: якщо основна перевантажена (503 / "high demand") або недоступна (404),
+// пробуємо наступну. Можна змінити змінною середовища GEMINI_FALLBACK_MODELS (через кому).
+const FALLBACK_MODELS = (process.env.GEMINI_FALLBACK_MODELS || "gemini-2.5-flash-lite,gemini-2.5-flash")
+    .split(',').map(m => m.trim()).filter(Boolean);
+const MODELS = [MODEL, ...FALLBACK_MODELS.filter(m => m !== MODEL)];
+const REQUEST_TIMEOUT_MS = 120000;
 const TTS_MODEL = "gemini-3.1-flash-tts-preview";
 const TTS_VOICE = "Kore"; // тепла жіноча інтонація; інші варіанти: Leda, Aoede, Callirrhoe...
 
@@ -50,61 +56,94 @@ function parseSampleRate(mimeType) {
     return match ? parseInt(match[1], 10) : 24000;
 }
 
+// Класифікація помилки Gemini
+function classifyError(err) {
+    const code = err?.code, status = err?.status, msg = (err?.message || '').toLowerCase();
+    if (code === 429 || status === 'RESOURCE_EXHAUSTED') return 'quota';        // ліміт ключа/проєкту → інший ключ
+    if (code === 503 || status === 'UNAVAILABLE' || msg.includes('high demand') || msg.includes('overloaded'))
+        return 'overloaded';                                                      // модель перевантажена → інша модель
+    if (code === 404 || status === 'NOT_FOUND') return 'model_missing';          // моделі немає → інша модель
+    return 'other';                                                               // невірний ключ тощо → інший ключ
+}
+
 app.post('/api/generate', async (req, res) => {
     const { prompt } = req.body;
 
     if (!apiKeys.length) {
-        return res.status(500).json({ error: 'Секретные ключи не настроены' });
+        return res.status(500).json({ ok: false, error: 'Секретные ключи не настроены' });
     }
 
-    let attempts = 0;
+    let overloadedSeen = false;
+    let lastError = '';
 
-    while (attempts < apiKeys.length) {
-        const currentKey = apiKeys[currentKeyIndex];
+    for (const model of MODELS) {
+        let attempts = 0;
 
-        try {
-            const response = await fetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${currentKey}`,
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        contents: [{ parts: [{ text: prompt }] }],
-                        generationConfig: { temperature: 0.35 }
-                    })
+        while (attempts < apiKeys.length) {
+            const currentKey = apiKeys[currentKeyIndex];
+
+            try {
+                const response = await fetch(
+                    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${currentKey}`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            contents: [{ parts: [{ text: prompt }] }],
+                            generationConfig: { temperature: 0.35 }
+                        }),
+                        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+                    }
+                );
+
+                const data = await response.json();
+
+                if (data.error) {
+                    lastError = data.error.message || String(data.error.code);
+                    const kind = classifyError(data.error);
+
+                    if (kind === 'overloaded') {
+                        // Перевантажена модель — для всіх ключів однаково, ключі НЕ перебираємо
+                        console.log(`[${model}] перевантажена: ${lastError} → наступна модель`);
+                        overloadedSeen = true;
+                        break;
+                    }
+                    if (kind === 'model_missing') {
+                        console.log(`[${model}] недоступна: ${lastError} → наступна модель`);
+                        break;
+                    }
+                    console.log(`[${model}] ключ #${currentKeyIndex} ${kind === 'quota' ? 'залімічений' : 'помилка: ' + lastError}, наступний ключ...`);
+                    currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
+                    attempts++;
+                    continue;
                 }
-            );
 
-            const data = await response.json();
+                const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+                if (!text) {
+                    // порожня відповідь (наприклад, блокування) — пробуємо іншу модель
+                    lastError = 'порожня відповідь: ' + (data.candidates?.[0]?.finishReason || data.promptFeedback?.blockReason || 'unknown');
+                    console.log(`[${model}] ${lastError} → наступна модель`);
+                    break;
+                }
 
-            // 429 — ліміт вичерпано, переходимо до наступного ключа
-            if (data.error?.code === 429 || data.error?.status === 'RESOURCE_EXHAUSTED') {
-                console.log(`Ключ #${currentKeyIndex} залімічений, переходжу до наступного...`);
+                // Успіх — залишаємось на цьому ключі для наступного запиту
+                if (model !== MODEL) console.log(`Відповідь отримано від запасної моделі ${model}`);
+                return res.json({ ok: true, text, model });
+
+            } catch (error) {
+                lastError = error.message;
+                console.log(`[${model}] ключ #${currentKeyIndex} виняток: ${error.message}`);
                 currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
                 attempts++;
-                continue;
             }
-
-            // Інша помилка API
-            if (data.error) {
-                console.log(`Ключ #${currentKeyIndex} помилка: ${data.error.message}`);
-                currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
-                attempts++;
-                continue;
-            }
-
-            // Успіх — залишаємось на цьому ключі для наступного запиту
-            const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-            return res.json({ ok: true, text });
-
-        } catch (error) {
-            console.log(`Ключ #${currentKeyIndex} виняток: ${error.message}`);
-            currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
-            attempts++;
         }
     }
 
-    res.status(500).json({ ok: false, error: 'Все ключи недоступны' });
+    const status = overloadedSeen ? 503 : 500;
+    res.status(status).json({
+        ok: false,
+        error: overloadedSeen ? 'Моделі Gemini перевантажені (high demand), спробуйте ще раз за хвилину' : 'Все ключи недоступны: ' + lastError
+    });
 });
 
 app.post('/api/tts', async (req, res) => {
@@ -180,7 +219,7 @@ app.post('/api/tts', async (req, res) => {
 
 // Перевірка що сервер живий
 app.get('/health', (req, res) => {
-    res.json({ ok: true, keys: apiKeys.length, currentKey: currentKeyIndex });
+    res.json({ ok: true, keys: apiKeys.length, currentKey: currentKeyIndex, models: MODELS });
 });
 
 const PORT = process.env.PORT || 3000;
