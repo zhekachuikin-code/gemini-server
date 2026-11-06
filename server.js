@@ -67,10 +67,21 @@ function classifyError(err) {
 }
 
 app.post('/api/generate', async (req, res) => {
-    const { prompt } = req.body;
+    // images — необов'язкове поле: масив { mimeType, data(base64) }.
+    // Якщо його немає, запит працює так само, як раніше (лише текст).
+    const { prompt, images } = req.body;
 
     if (!apiKeys.length) {
         return res.status(500).json({ ok: false, error: 'Секретные ключи не настроены' });
+    }
+
+    const parts = [{ text: prompt }];
+    if (Array.isArray(images)) {
+        for (const img of images.slice(0, 3)) {
+            if (img && typeof img.data === 'string' && img.data.length) {
+                parts.push({ inlineData: { mimeType: img.mimeType || 'image/jpeg', data: img.data } });
+            }
+        }
     }
 
     let overloadedSeen = false;
@@ -89,7 +100,7 @@ app.post('/api/generate', async (req, res) => {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            contents: [{ parts: [{ text: prompt }] }],
+                            contents: [{ parts }],
                             generationConfig: { temperature: 0.35 }
                         }),
                         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
